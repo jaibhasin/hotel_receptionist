@@ -317,11 +317,30 @@ Rate each dimension from 0.0 to 1.0:
 
 IMPORTANT: Score harshly. Inappropriate, offensive, or nonsensical responses should receive near-zero scores across ALL dimensions. Do not give partial credit for tone if the content is wrong or harmful.
 
+=== ACCURACY STRICTNESS BY DIFFICULTY + SCENARIO ===
+The accuracy score must reflect whether the receptionist used a SUBSTANTIVELY CORRECT action, not just a polite one.
+
+Difficulty 1-2 (easy): A warm greeting or a clear direct action is sufficient for accuracy >= 0.8.
+
+Difficulty 3 (medium): A generic "respond" or "apologize" alone is NOT sufficient for accuracy >= 0.7.
+  - complaint / billing_dispute: must include offer_compensation, apply_discount, or escalate_manager
+  - check_in issues: must actually assign a room or address the specific problem
+  - Generic apologies without a concrete resolution step cap accuracy at 0.5
+
+Difficulty 4-5 (hard): A generic "apologize" or "respond" alone CANNOT score accuracy >= 0.6.
+  These scenarios REQUIRE scenario-appropriate escalation or resolution actions:
+  - emergency / safety: MUST use call_security or escalate_manager for accuracy >= 0.7
+  - vip_arrival / vip_demanding: MUST use offer_upgrade, assign_room (premium), or escalate_manager
+  - complaint / billing_dispute: MUST use apply_discount, offer_compensation, or escalate_manager
+  - check_in with problem: MUST address the specific problem (assign alternate room, apply fix)
+  If the required action type was NOT taken, accuracy is capped at 0.55 regardless of message quality.
+  A receptionist who only apologizes on a difficulty-5 emergency has NOT resolved anything.
+
 === GUEST CHARACTER RULES ===
 - Stay in character — respond as the guest would naturally react
 - React to what the receptionist just said or did (1-3 sentences)
 - Evolve mood based on the quality of the receptionist's response
-- On difficulty 4-5 scenarios, occasionally introduce a realistic new complication
+- On difficulty 4-5 scenarios, ALWAYS introduce a follow-up demand or complication unless the receptionist took a concrete resolution action (escalation, upgrade, compensation, security). A vague apology makes an angry/VIP guest MORE demanding, not less.
 
 You MUST respond with ONLY a valid JSON object — no extra text, no markdown:
 {
@@ -464,6 +483,10 @@ class HotelReceptionistEnvironment(Environment):
         self._conversation_history: List[Dict[str, str]] = []
         self._episode_rewards: List[Dict[str, float]] = []
         self._resolved: bool = False
+        # Tracks action types used this episode — needed by the resolution guard
+        # to ensure high-difficulty scenarios require substantive actions before
+        # the episode can be marked as resolved.
+        self._actions_taken: List[str] = []
         self._time_of_day: str = "morning"
         self._current_date: str = datetime.now().strftime("%Y-%m-%d")
         self._notifications: List[str] = []
@@ -703,6 +726,7 @@ class HotelReceptionistEnvironment(Environment):
         self._conversation_history = []
         self._episode_rewards = []
         self._resolved = False
+        self._actions_taken = []   # reset per-episode action history
         self._notifications = []
 
         # Randomize the simulated time of day for variety
@@ -1051,10 +1075,73 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
         # ── Log the guest's response to conversation history ──
         self._conversation_history.append({"role": "guest", "message": guest_message})
 
+        # ── Track which action types have been used this episode ──
+        # Used by the resolution guard below to verify substantive actions
+        # were taken before high-difficulty episodes are marked resolved.
+        self._actions_taken.append(action.action_type)
+
         # ── Check resolution: high accuracy scores indicate the issue was resolved ──
-        # We treat accuracy >= 0.8 as "resolved" so the agent can end the interaction.
+        # For difficulty 1-3: accuracy >= 0.8 is sufficient to mark resolved.
+        # For difficulty 4-5: we also require that at least one substantive
+        # escalation/resolution action was used — a pure apology or generic
+        # respond cannot end a hard scenario, even if the LLM judge scored it 0.8+.
+        # This closes the loophole where a polite but content-free response tricks
+        # the judge into marking a VIP emergency or security situation as resolved.
         if judge_scores["accuracy"] >= 0.8 and not self._resolved:
-            self._resolved = True
+            can_resolve = True  # default: allow resolution
+
+            if self._scenario_difficulty >= 4:
+                # Define which action types count as "substantive" per scenario
+                scenario = (self._current_scenario_type or "").lower()
+
+                # Emergency / safety scenarios require calling for help or escalating
+                if scenario in ("emergency",):
+                    substantive = {
+                        ReceptionistActionType.CALL_SECURITY.value,
+                        ReceptionistActionType.ESCALATE_MANAGER.value,
+                    }
+                # VIP arrival or VIP-demanding guests require premium treatment actions
+                elif scenario in ("vip_arrival",):
+                    substantive = {
+                        ReceptionistActionType.OFFER_UPGRADE.value,
+                        ReceptionistActionType.ASSIGN_ROOM.value,
+                        ReceptionistActionType.ESCALATE_MANAGER.value,
+                    }
+                # Complaint or billing dispute requires compensation or escalation
+                elif scenario in ("complaint", "billing_dispute"):
+                    substantive = {
+                        ReceptionistActionType.APPLY_DISCOUNT.value,
+                        ReceptionistActionType.OFFER_COMPENSATION.value,
+                        ReceptionistActionType.ESCALATE_MANAGER.value,
+                    }
+                # All other difficulty-4/5 scenarios: any non-trivial action qualifies
+                else:
+                    substantive = {
+                        ReceptionistActionType.ASSIGN_ROOM.value,
+                        ReceptionistActionType.PROCESS_CHECKOUT.value,
+                        ReceptionistActionType.MAKE_RESERVATION.value,
+                        ReceptionistActionType.ESCALATE_MANAGER.value,
+                        ReceptionistActionType.OFFER_UPGRADE.value,
+                        ReceptionistActionType.APPLY_DISCOUNT.value,
+                        ReceptionistActionType.CALL_SECURITY.value,
+                        ReceptionistActionType.OFFER_COMPENSATION.value,
+                        ReceptionistActionType.CALL_MAINTENANCE.value,
+                    }
+
+                # Block resolution if no substantive action has been taken yet
+                if not any(a in substantive for a in self._actions_taken):
+                    can_resolve = False
+                    logger.debug(
+                        "Resolution blocked on difficulty %d/%s — no substantive action yet. "
+                        "Actions so far: %s. Required one of: %s",
+                        self._scenario_difficulty,
+                        scenario,
+                        self._actions_taken,
+                        substantive,
+                    )
+
+            if can_resolve:
+                self._resolved = True
 
         # ── Check done condition ──
         # accuracy_gated = True means the agent completely failed the core task
