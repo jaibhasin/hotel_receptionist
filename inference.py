@@ -431,12 +431,23 @@ async def main() -> None:
     print(f"  Tasks:  {len(TASKS)} (easy / medium / hard)", flush=True)
     print("=" * 60, flush=True)
 
-    # ── Connect to the environment container ─────────────────
-    # from_docker_image() starts (or connects to) the Docker container
-    # running the hotel receptionist environment server.
-    # The env's internal LLM calls (world engine + judge) happen
-    # INSIDE the container — our inference.py only makes agent LLM calls.
-    env = await HotelReceptionistEnv.from_docker_image(IMAGE_NAME)
+    # ── Connect to the environment ─────────────────────────────
+    # If IMAGE_NAME is set → use Docker (validator mode)
+    # If ENV_URL is set → connect directly to a running server (local testing)
+    # ENV_URL example: https://jai3-hotel-receptionist.hf.space
+    env_url = os.getenv("ENV_URL")
+
+    if IMAGE_NAME:
+        # Validator mode: spin up Docker container with the environment
+        env = await HotelReceptionistEnv.from_docker_image(IMAGE_NAME)
+    elif env_url:
+        # Local testing mode: connect to already-running HF Space or local server
+        env = HotelReceptionistEnv(base_url=env_url)
+        await env.connect()
+    else:
+        print("ERROR: Set IMAGE_NAME (Docker) or ENV_URL (direct connect).", flush=True)
+        print("  For local testing: export ENV_URL='https://jai3-hotel-receptionist.hf.space'", flush=True)
+        sys.exit(1)
 
     # ── Run each task sequentially ───────────────────────────
     all_results = []
