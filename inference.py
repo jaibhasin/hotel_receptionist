@@ -64,7 +64,9 @@ API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "meta-llama/Llama-3.1-70B-Instruct"
 
 # HF token — used for both LLM calls and env container auth
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+# Validator injects API_KEY pointing to their LiteLLM proxy — use it first.
+# Fall back to HF_TOKEN for local testing only.
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 
 # Environment / benchmark label used in [START] log lines
 BENCHMARK = "hotel_receptionist"
