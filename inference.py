@@ -428,8 +428,22 @@ async def main() -> None:
     print(f"  API:    {API_BASE_URL}", flush=True)
     print(f"  Model:  {MODEL_NAME}", flush=True)
     print(f"  Image:  {IMAGE_NAME}", flush=True)
+    print(f"  Key:    {API_KEY[:8]}...{API_KEY[-4:]}" if API_KEY and len(API_KEY) > 12 else f"  Key:    {API_KEY}", flush=True)
     print(f"  Tasks:  {len(TASKS)} (easy / medium / hard)", flush=True)
     print("=" * 60, flush=True)
+
+    # Sanity check: make a test LLM call to verify the proxy is reachable
+    # This call is NOT wrapped in try/except so we see the real error
+    print("[DEBUG] Testing LLM proxy connection...", flush=True)
+    try:
+        test_completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Say hello in one word."}],
+            max_tokens=10,
+        )
+        print(f"[DEBUG] LLM proxy OK: {test_completion.choices[0].message.content}", flush=True)
+    except Exception as e:
+        print(f"[DEBUG] LLM proxy FAILED: {e}", flush=True)
 
     # ── Connect to the environment ─────────────────────────────
     # If IMAGE_NAME is set → use Docker (validator mode)
