@@ -11,21 +11,22 @@ Hotel Receptionist RL Environment — Hackathon Inference Script.
 Runs 3 named tasks (easy → medium → hard) against the hotel receptionist
 environment and emits the required structured stdout logs for evaluation.
 
+=== HOW IT WORKS ===
+    1. The environment runs inside a Docker container (HF Space)
+    2. This script connects to it via WebSocket using HotelReceptionistEnv client
+    3. The LLM agent (OpenAI client → HF Router) decides actions
+    4. The environment scores actions and generates guest replies internally
+
 === REQUIRED ENV VARS ===
-    API_BASE_URL   The API endpoint for the LLM (default: HF Router)
-    MODEL_NAME     The model identifier to use for inference
-    HF_TOKEN       Your Hugging Face / API key
+    API_BASE_URL       The API endpoint for the LLM (default: HF Router)
+    MODEL_NAME         The model identifier to use for inference
+    HF_TOKEN           Your Hugging Face / API key
+    IMAGE_NAME         Docker image name for the environment container
 
 === STDOUT FORMAT (exact, required by judges) ===
     [START] task=<task_name> env=<benchmark> model=<model_name>
     [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
     [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
-
-=== HOW TO RUN ===
-    export HF_TOKEN="hf_your_token_here"
-    export API_BASE_URL="https://router.huggingface.co/v1"   # optional
-    export MODEL_NAME="meta-llama/Llama-3.1-70B-Instruct"   # optional
-    python inference.py
 """
 
 import asyncio
@@ -43,15 +44,18 @@ from openai import OpenAI
 # ──────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Import the OpenEnv client (connects to env via WebSocket)
+# NOT the raw environment class — the client talks to the Docker container
+from client import HotelReceptionistEnv
 from models import HotelReceptionistAction, HotelReceptionistObservation
-from server.hotel_receptionist_environment import HotelReceptionistEnvironment
 
 
 # ──────────────────────────────────────────────────────────────
-#  Configuration — all three must come from env vars per the
-#  hackathon checklist. Defaults are provided so the script
-#  still runs in development without them set.
+#  Configuration — env vars set by judges during validation
 # ──────────────────────────────────────────────────────────────
+
+# Docker image name for the environment container
+IMAGE_NAME = os.getenv("IMAGE_NAME")
 
 # LLM API endpoint (OpenAI-compatible). Judges override via API_BASE_URL.
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
@@ -59,7 +63,7 @@ API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 # Model to use for inference. Judges override via MODEL_NAME.
 MODEL_NAME = os.getenv("MODEL_NAME") or "meta-llama/Llama-3.1-70B-Instruct"
 
-# HF token — mandatory, no default (script will exit if missing)
+# HF token — used for both LLM calls and env container auth
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
 # Environment / benchmark label used in [START] log lines
@@ -75,12 +79,9 @@ SUCCESS_SCORE_THRESHOLD = 0.4
 # ──────────────────────────────────────────────────────────────
 #  Named Tasks — easy → medium → hard
 #
-#  A fixed seed makes each task deterministic and reproducible
-#  across runs, which is required by the evaluation criteria.
-#
-#  The "grader" for each task is the environment's built-in reward
-#  function (rule-based Accuracy + Efficiency, LLM-judged
-#  Professionalism + Empathy), which always returns [0.0, 1.0].
+#  Each task runs a full episode. The environment generates the
+#  scenario internally (via its LLM World Engine inside the
+#  Docker container). The seed makes it deterministic.
 # ──────────────────────────────────────────────────────────────
 
 TASKS = [
@@ -112,27 +113,15 @@ TASKS = [
 # ──────────────────────────────────────────────────────────────
 
 def log_start(task: str, env: str, model: str) -> None:
-    """
-    Emit the [START] line at the beginning of each task episode.
-
-    Format: [START] task=<name> env=<benchmark> model=<model_name>
-    """
+    """Emit [START] line at the beginning of each task episode."""
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
-    """
-    Emit one [STEP] line immediately after env.step() returns.
-
-    Format: [STEP] step=<n> action=<str> reward=<0.00> done=<bool> error=<str|null>
-    Rules:
-      - reward formatted to 2 decimal places
-      - done is lowercase true/false
-      - error is the error message string, or null if no error
-    """
+    """Emit [STEP] line immediately after env.step() returns."""
     error_val = error if error else "null"
     done_val = str(done).lower()
-    # Escape the action string so it fits on one line (no internal newlines)
+    # Keep action on one line (no internal newlines)
     action_safe = action.replace("\n", " ").replace("\r", "")[:120]
     print(
         f"[STEP] step={step} action={action_safe} reward={reward:.2f} "
@@ -142,15 +131,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    """
-    Emit the [END] line after each task episode completes (always, even on error).
-
-    Format: [END] success=<bool> steps=<n> score=<0.000> rewards=<r1,r2,...>
-    Rules:
-      - success is lowercase true/false
-      - score formatted to 3 decimal places
-      - rewards is a comma-separated list, each to 2 decimal places
-    """
+    """Emit [END] line after each task episode completes (always, even on error)."""
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} "
@@ -196,14 +177,8 @@ def build_user_prompt(obs: HotelReceptionistObservation) -> str:
     """
     Convert the current environment observation into a text prompt for the LLM.
 
-    Packs all relevant context (scenario type, guest profile, conversation
-    history, available actions, hotel state) into a single readable block.
-
-    Args:
-        obs: latest observation returned by env.reset() or env.step()
-
-    Returns:
-        Formatted prompt string the LLM uses to choose its next action
+    Packs all relevant context (scenario, guest profile, conversation history,
+    available actions, hotel state) into a single readable block.
     """
     # Guest profile summary
     profile = obs.guest_profile
@@ -265,17 +240,10 @@ def get_agent_action(client: OpenAI, obs: HotelReceptionistObservation) -> Hotel
 
     Calls the OpenAI-compatible API at API_BASE_URL using MODEL_NAME.
     Falls back to a safe default action if the API call fails.
-
-    Args:
-        client: OpenAI client pointed at the HF Router
-        obs:    current environment observation
-
-    Returns:
-        HotelReceptionistAction ready to pass to env.step()
     """
     user_prompt = build_user_prompt(obs)
     try:
-        # Call the LLM — uses OpenAI SDK but points at HF Router
+        # Call the LLM via HF Router (OpenAI-compatible endpoint)
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -289,7 +257,7 @@ def get_agent_action(client: OpenAI, obs: HotelReceptionistObservation) -> Hotel
         raw = (completion.choices[0].message.content or "").strip()
     except Exception as exc:
         print(f"[DEBUG] LLM call failed: {exc}", flush=True, file=sys.stderr)
-        # Safe fallback: polite generic reply so the episode keeps running
+        # Safe fallback so the episode keeps running
         raw = json.dumps({"action_type": "respond",
                           "message": "I apologize for the delay. Let me assist you right away."})
 
@@ -331,7 +299,7 @@ def get_agent_action(client: OpenAI, obs: HotelReceptionistObservation) -> Hotel
 # ──────────────────────────────────────────────────────────────
 
 async def run_task(
-    env: HotelReceptionistEnvironment,
+    env: HotelReceptionistEnv,
     client: OpenAI,
     task: dict,
 ) -> dict:
@@ -339,28 +307,15 @@ async def run_task(
     Run one named task (a complete episode) and emit the required logs.
 
     Flow:
-      1. [START] log emitted
-      2. env.reset(seed=fixed_seed) → deterministic scenario
-      3. Loop MAX_STEPS times:
-           LLM picks action → env.step(action) → [STEP] log
+      1. [START] log
+      2. env.reset() → get initial observation from Docker container
+      3. Loop up to MAX_STEPS: LLM picks action → env.step(action) → [STEP] log
       4. env.close() in finally block
-      5. [END] log emitted (always, even if an exception occurred)
+      5. [END] log (always emitted, even on exception)
 
     Score = mean(step_rewards), clamped to [0.0, 1.0].
-    Divides by actual steps taken so early resolution isn't penalized.
-    Each step reward is already in [0.0, 1.0] from the environment's
-    reward function, so the final score is always in [0.0, 1.0].
-
-    Args:
-        env:    HotelReceptionistEnvironment instance (in-process)
-        client: OpenAI client for LLM calls
-        task:   dict with task_id, seed, description
-
-    Returns:
-        Dict with task_id, score, success, steps, rewards
     """
     task_id = task["task_id"]
-    seed = task["seed"]
 
     # Emit [START] before anything else
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
@@ -371,8 +326,11 @@ async def run_task(
     success = False
 
     try:
-        # reset() with a fixed seed → same scenario every run (deterministic grader)
-        obs = env.reset(seed=seed)
+        # reset() tells the Docker container to start a new episode
+        # The env's internal LLM World Engine generates the scenario
+        # Pass seed for deterministic, reproducible scenarios across runs
+        result = await env.reset(seed=task["seed"])
+        obs = result.observation
 
         print(f"[DEBUG] {task_id}: {obs.scenario_type} diff={obs.scenario_difficulty}/5 "
               f"guest={obs.guest_profile.get('name')} mood={obs.guest_profile.get('mood')}",
@@ -380,20 +338,21 @@ async def run_task(
 
         for step in range(1, MAX_STEPS + 1):
             # Episode finished early (environment set done=True)
-            if obs.done:
+            if result.done:
                 break
 
             # LLM agent decides what to do
             action = get_agent_action(client, obs)
 
-            # Step the environment: apply action → get observation + reward
+            # Step the environment via WebSocket → Docker container
             try:
-                obs = env.step(action)
-                reward = float(obs.reward or 0.0)
-                done = bool(obs.done)
+                result = await env.step(action)
+                obs = result.observation
+                reward = float(result.reward or 0.0)
+                done = bool(result.done)
                 error = None
             except Exception as step_exc:
-                # Record the error but don't crash — emit [STEP] then [END]
+                # Record the error but don't crash
                 reward = 0.0
                 done = True
                 error = str(step_exc)[:80]
@@ -401,7 +360,7 @@ async def run_task(
             rewards.append(reward)
             steps_taken = step
 
-            # Emit [STEP] immediately after env.step() — required format
+            # Emit [STEP] immediately after env.step()
             log_step(
                 step=step,
                 action=action.action_type,
@@ -414,21 +373,18 @@ async def run_task(
                 break
 
         # ── Compute final score ──────────────────────────────
-        # Mean reward across actual steps taken, clamped to [0.0, 1.0].
-        # Dividing by actual steps (not MAX_STEPS) so an agent that resolves
-        # a task in 3 steps with reward 0.9 scores 0.9, not 0.27.
+        # Mean reward across actual steps, clamped to [0.0, 1.0]
         actual_steps = len(rewards)
         score = sum(rewards) / actual_steps if actual_steps > 0 else 0.0
         score = min(max(score, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
-    finally:
-        # Always close the environment, even if an exception occurred
-        try:
-            env.close()
-        except Exception as close_exc:
-            print(f"[DEBUG] env.close() error: {close_exc}", flush=True, file=sys.stderr)
+    except Exception as exc:
+        # Catch any exception (including RuntimeError from reset())
+        # so we still emit [END] and don't crash the whole script
+        print(f"[DEBUG] Task {task_id} failed: {exc}", flush=True, file=sys.stderr)
 
+    finally:
         # Always emit [END] — even if the episode failed
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
@@ -442,16 +398,16 @@ async def run_task(
 
 
 # ──────────────────────────────────────────────────────────────
-#  Main — runs all 3 tasks and prints an aggregate summary
+#  Main — connect to env container, run all 3 tasks, print summary
 # ──────────────────────────────────────────────────────────────
 
 async def main() -> None:
     """
-    Entry point: validate env vars, run all 3 tasks, print summary.
+    Entry point: connect to environment Docker container via OpenEnv client,
+    run all 3 tasks sequentially, print aggregate summary.
 
-    Uses asyncio.run() to match the sample inference script pattern,
-    even though the environment itself is synchronous. This keeps the
-    script compatible with async client variants (from_docker_image etc.)
+    Uses from_docker_image() to connect to the environment running in Docker,
+    matching the pattern from the official sample inference script.
     """
     # ── Validate required env vars ───────────────────────────
     if not API_KEY:
@@ -459,9 +415,9 @@ async def main() -> None:
         print("  export HF_TOKEN='hf_your_token_here'", flush=True)
         sys.exit(1)
 
-    # ── Initialize LLM client ────────────────────────────────
-    # OpenAI SDK pointed at the HF Router — no OpenAI key needed.
-    # API_BASE_URL and MODEL_NAME come from env vars (set at module level).
+    # ── Initialize LLM client (for the agent's decisions) ────
+    # OpenAI SDK pointed at the HF Router — this is for the AGENT's LLM calls.
+    # The environment's internal LLM calls happen inside the Docker container.
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     print("=" * 60, flush=True)
@@ -469,21 +425,32 @@ async def main() -> None:
     print("=" * 60, flush=True)
     print(f"  API:    {API_BASE_URL}", flush=True)
     print(f"  Model:  {MODEL_NAME}", flush=True)
+    print(f"  Image:  {IMAGE_NAME}", flush=True)
     print(f"  Tasks:  {len(TASKS)} (easy / medium / hard)", flush=True)
     print("=" * 60, flush=True)
 
-    # ── Run each task sequentially ───────────────────────────
-    # Each task gets its own environment instance for clean state isolation.
-    # A fresh env per task also means env.close() is safe to call after each.
-    all_results = []
-    for task in TASKS:
-        print(f"\n--- Running task: {task['task_id']} ---", flush=True)
-        print(f"    {task['description']}", flush=True)
+    # ── Connect to the environment container ─────────────────
+    # from_docker_image() starts (or connects to) the Docker container
+    # running the hotel receptionist environment server.
+    # The env's internal LLM calls (world engine + judge) happen
+    # INSIDE the container — our inference.py only makes agent LLM calls.
+    env = await HotelReceptionistEnv.from_docker_image(IMAGE_NAME)
 
-        # New environment instance per task for clean state
-        env = HotelReceptionistEnvironment()
-        result = await run_task(env, client, task)
-        all_results.append(result)
+    # ── Run each task sequentially ───────────────────────────
+    all_results = []
+    try:
+        for task in TASKS:
+            print(f"\n--- Running task: {task['task_id']} ---", flush=True)
+            print(f"    {task['description']}", flush=True)
+
+            result = await run_task(env, client, task)
+            all_results.append(result)
+    finally:
+        # Always close the environment connection (cleans up Docker container)
+        try:
+            await env.close()
+        except Exception as e:
+            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True, file=sys.stderr)
 
     # ── Aggregate summary ────────────────────────────────────
     print(f"\n{'=' * 60}", flush=True)

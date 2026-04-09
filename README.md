@@ -7,7 +7,7 @@ sdk: docker
 pinned: false
 app_port: 8000
 base_path: /web
-short_description: LLM-driven hotel front-desk simulation for training RL agents across 15 scenario types with multi-dimensional reward scoring
+short_description: LLM-driven hotel simulation for RL agent training
 tags:
   - openenv
 ---
