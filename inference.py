@@ -21,7 +21,7 @@ environment and emits the required structured stdout logs for evaluation.
     API_BASE_URL       The API endpoint for the LLM (default: HF Router)
     MODEL_NAME         The model identifier to use for inference
     HF_TOKEN           Your Hugging Face / API key
-    IMAGE_NAME         Docker image name for the environment container
+    LOCAL_IMAGE_NAME   Docker image name for the environment container (optional)
 
 === STDOUT FORMAT (exact, required by judges) ===
     [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -54,19 +54,15 @@ from models import HotelReceptionistAction, HotelReceptionistObservation
 #  Configuration — env vars set by judges during validation
 # ──────────────────────────────────────────────────────────────
 
-# Docker image name for the environment container
-IMAGE_NAME = os.getenv("IMAGE_NAME")
-
-# LLM API endpoint (OpenAI-compatible). Judges override via API_BASE_URL.
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-
-# Model to use for inference. Judges override via MODEL_NAME.
-MODEL_NAME = os.getenv("MODEL_NAME") or "meta-llama/Llama-3.1-70B-Instruct"
-
-# HF token — used for both LLM calls and env container auth
-# Validator injects API_KEY pointing to their LiteLLM proxy — use it first.
-# Fall back to HF_TOKEN for local testing only.
-API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
+# Env vars exactly as specified in the pre-submission checklist:
+#   API_BASE_URL  — LLM proxy endpoint (validator injects their LiteLLM proxy)
+#   MODEL_NAME    — which model to call
+#   HF_TOKEN      — API key for the LLM proxy (validator injects this)
+#   LOCAL_IMAGE_NAME — Docker image for from_docker_image() (optional)
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-70B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 # Environment / benchmark label used in [START] log lines
 BENCHMARK = "hotel_receptionist"
@@ -412,54 +408,40 @@ async def main() -> None:
     matching the pattern from the official sample inference script.
     """
     # ── Validate required env vars ───────────────────────────
-    if not API_KEY:
+    if not HF_TOKEN:
         print("ERROR: HF_TOKEN environment variable is required.", flush=True)
         print("  export HF_TOKEN='hf_your_token_here'", flush=True)
         sys.exit(1)
 
     # ── Initialize LLM client (for the agent's decisions) ────
-    # OpenAI SDK pointed at the HF Router — this is for the AGENT's LLM calls.
-    # The environment's internal LLM calls happen inside the Docker container.
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # OpenAI SDK with base_url and api_key from validator-injected env vars.
+    # This is the ONLY way LLM calls should be made — through their proxy.
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
     print("=" * 60, flush=True)
     print("  HOTEL RECEPTIONIST — INFERENCE EVALUATION", flush=True)
     print("=" * 60, flush=True)
     print(f"  API:    {API_BASE_URL}", flush=True)
     print(f"  Model:  {MODEL_NAME}", flush=True)
-    print(f"  Image:  {IMAGE_NAME}", flush=True)
-    print(f"  Key:    {API_KEY[:8]}...{API_KEY[-4:]}" if API_KEY and len(API_KEY) > 12 else f"  Key:    {API_KEY}", flush=True)
+    print(f"  Image:  {LOCAL_IMAGE_NAME}", flush=True)
+    print(f"  Key:    {HF_TOKEN[:8]}...{HF_TOKEN[-4:]}" if HF_TOKEN and len(HF_TOKEN) > 12 else f"  Key:    {HF_TOKEN}", flush=True)
     print(f"  Tasks:  {len(TASKS)} (easy / medium / hard)", flush=True)
     print("=" * 60, flush=True)
 
-    # Sanity check: make a test LLM call to verify the proxy is reachable
-    # This call is NOT wrapped in try/except so we see the real error
-    print("[DEBUG] Testing LLM proxy connection...", flush=True)
-    try:
-        test_completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": "Say hello in one word."}],
-            max_tokens=10,
-        )
-        print(f"[DEBUG] LLM proxy OK: {test_completion.choices[0].message.content}", flush=True)
-    except Exception as e:
-        print(f"[DEBUG] LLM proxy FAILED: {e}", flush=True)
-
     # ── Connect to the environment ─────────────────────────────
-    # If IMAGE_NAME is set → use Docker (validator mode)
+    # If LOCAL_IMAGE_NAME is set → use Docker (validator mode)
     # If ENV_URL is set → connect directly to a running server (local testing)
-    # ENV_URL example: https://jai3-hotel-receptionist.hf.space
     env_url = os.getenv("ENV_URL")
 
-    if IMAGE_NAME:
+    if LOCAL_IMAGE_NAME:
         # Validator mode: spin up Docker container with the environment
-        env = await HotelReceptionistEnv.from_docker_image(IMAGE_NAME)
+        env = await HotelReceptionistEnv.from_docker_image(LOCAL_IMAGE_NAME)
     elif env_url:
         # Local testing mode: connect to already-running HF Space or local server
         env = HotelReceptionistEnv(base_url=env_url)
         await env.connect()
     else:
-        print("ERROR: Set IMAGE_NAME (Docker) or ENV_URL (direct connect).", flush=True)
+        print("ERROR: Set LOCAL_IMAGE_NAME (Docker) or ENV_URL (direct connect).", flush=True)
         print("  For local testing: export ENV_URL='https://jai3-hotel-receptionist.hf.space'", flush=True)
         sys.exit(1)
 
