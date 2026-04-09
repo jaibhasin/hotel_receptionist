@@ -53,7 +53,12 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import HotelReceptionistAction, HotelReceptionistObservation
+# Try relative import first (when loaded as part of the hotel_receptionist package by the server)
+# Fall back to absolute import (when inference.py imports client.py directly in the validator)
+try:
+    from .models import HotelReceptionistAction, HotelReceptionistObservation
+except ImportError:
+    from models import HotelReceptionistAction, HotelReceptionistObservation
 
 
 class HotelReceptionistEnv(
