@@ -59,9 +59,12 @@ from models import HotelReceptionistAction, HotelReceptionistObservation
 #   MODEL_NAME    — which model to call
 #   HF_TOKEN      — API key for the LLM proxy (validator injects this)
 #   LOCAL_IMAGE_NAME — Docker image for from_docker_image() (optional)
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-70B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
+# Defaults match the hackathon sample exactly.
+# The validator overwrites these with their own proxy + model.
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+# Accept either HF_TOKEN or API_KEY — validator may inject either
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 # Environment / benchmark label used in [START] log lines
@@ -407,16 +410,10 @@ async def main() -> None:
     Uses from_docker_image() to connect to the environment running in Docker,
     matching the pattern from the official sample inference script.
     """
-    # ── Validate required env vars ───────────────────────────
-    if not HF_TOKEN:
-        print("ERROR: HF_TOKEN environment variable is required.", flush=True)
-        print("  export HF_TOKEN='hf_your_token_here'", flush=True)
-        sys.exit(1)
-
-    # ── Initialize LLM client (for the agent's decisions) ────
-    # OpenAI SDK with base_url and api_key from validator-injected env vars.
-    # This is the ONLY way LLM calls should be made — through their proxy.
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    # ── Initialize LLM client (OpenAI-compatible, routed through validator's proxy) ──
+    # Use API_KEY which accepts both HF_TOKEN and API_KEY env vars.
+    # base_url comes from API_BASE_URL — the validator's LiteLLM proxy endpoint.
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     print("=" * 60, flush=True)
     print("  HOTEL RECEPTIONIST — INFERENCE EVALUATION", flush=True)
@@ -424,30 +421,23 @@ async def main() -> None:
     print(f"  API:    {API_BASE_URL}", flush=True)
     print(f"  Model:  {MODEL_NAME}", flush=True)
     print(f"  Image:  {LOCAL_IMAGE_NAME}", flush=True)
-    print(f"  Key:    {HF_TOKEN[:8]}...{HF_TOKEN[-4:]}" if HF_TOKEN and len(HF_TOKEN) > 12 else f"  Key:    {HF_TOKEN}", flush=True)
+    key_display = f"{API_KEY[:8]}...{API_KEY[-4:]}" if API_KEY and len(API_KEY) > 12 else str(API_KEY)
+    print(f"  Key:    {key_display}", flush=True)
     print(f"  Tasks:  {len(TASKS)} (easy / medium / hard)", flush=True)
     print("=" * 60, flush=True)
 
-    # ── Connect to the environment ─────────────────────────────
-    # If LOCAL_IMAGE_NAME is set → use Docker (validator mode)
-    # If ENV_URL is set → connect directly to a running server (local testing)
-    #
-    # IMPORTANT: from_docker_image() / connect() can raise if the container
-    # fails to start or the server is unreachable. We wrap the entire
-    # connection + task loop in a try/finally so that:
-    #   1. A connection failure is caught and logged (not unhandled)
-    #   2. env.close() is always attempted to clean up Docker containers
-    #   3. Each task still emits [END] via run_task()'s own finally block
+    # ── Connect to environment and run all tasks ──────────────
+    # env_url / LOCAL_IMAGE_NAME both optional — validator sets one or the other.
+    # all_results initialised here so the summary below is always safe to access.
     env_url = os.getenv("ENV_URL")
+    env = None
+    all_results = []
 
-    env = None  # initialise so the finally block can safely check it
     try:
         if LOCAL_IMAGE_NAME:
-            # Validator mode: spin up Docker container with the environment.
-            # Forward the validator-injected env vars into the container so the
-            # environment's LLM World Engine routes through the same LiteLLM proxy.
-            # ALL three vars are required: API_BASE_URL sets the proxy endpoint,
-            # HF_TOKEN/API_KEY authenticates, MODEL_NAME selects the model.
+            # Validator mode: spin up the Docker container.
+            # Forward ALL injected env vars into the container so the environment's
+            # LLM World Engine uses the validator's proxy (not a hardcoded URL).
             container_env: dict = {}
             for var in ("API_BASE_URL", "MODEL_NAME", "HF_TOKEN", "API_KEY"):
                 val = os.getenv(var)
@@ -458,44 +448,44 @@ async def main() -> None:
                 env_vars=container_env if container_env else None,
             )
         elif env_url:
-            # Local testing mode: connect to already-running HF Space or local server
+            # Direct connect mode: HF Space or local server already running.
             env = HotelReceptionistEnv(base_url=env_url)
             await env.connect()
         else:
-            print("ERROR: Set LOCAL_IMAGE_NAME (Docker) or ENV_URL (direct connect).", flush=True)
-            print("  For local testing: export ENV_URL='https://jai3-hotel-receptionist.hf.space'", flush=True)
-            sys.exit(1)
+            # Neither set — emit [START]/[END] for all tasks so harness gets output,
+            # then raise so the participant log shows a clear error.
+            for task in TASKS:
+                log_start(task=task["task_id"], env=BENCHMARK, model=MODEL_NAME)
+                log_end(success=False, steps=0, score=0.0, rewards=[])
+            raise RuntimeError(
+                "Neither LOCAL_IMAGE_NAME nor ENV_URL is set. "
+                "Set LOCAL_IMAGE_NAME (Docker image) or ENV_URL (server URL)."
+            )
 
-        # ── Run each task sequentially ───────────────────────────
-        all_results = []
         for task in TASKS:
             print(f"\n--- Running task: {task['task_id']} ---", flush=True)
             print(f"    {task['description']}", flush=True)
-
             result = await run_task(env, client, task)
             all_results.append(result)
 
-    except SystemExit:
-        # Re-raise sys.exit() calls (e.g. missing env vars) without masking them
-        raise
-    except Exception as conn_exc:
-        # Connection-level failure: env never started, so no tasks ran.
-        # Emit [END] for each task so the harness doesn't stall waiting for output.
-        print(f"[DEBUG] Environment connection failed: {conn_exc}", flush=True, file=sys.stderr)
+    except Exception as exc:
+        # Catch connection failures or the RuntimeError above.
+        # Emit [START]/[END] for any tasks that didn't run so the harness isn't left waiting.
+        print(f"[DEBUG] Environment setup failed: {exc}", flush=True, file=sys.stderr)
+        completed_ids = {r["task_id"] for r in all_results}
         for task in TASKS:
-            log_start(task=task["task_id"], env=BENCHMARK, model=MODEL_NAME)
-            log_end(success=False, steps=0, score=0.0, rewards=[])
-        all_results = [
-            {"task_id": t["task_id"], "score": 0.0, "success": False, "steps": 0, "rewards": []}
-            for t in TASKS
-        ]
+            if task["task_id"] not in completed_ids:
+                log_start(task=task["task_id"], env=BENCHMARK, model=MODEL_NAME)
+                log_end(success=False, steps=0, score=0.0, rewards=[])
+                all_results.append(
+                    {"task_id": task["task_id"], "score": 0.0, "success": False, "steps": 0, "rewards": []}
+                )
     finally:
-        # Always close/clean up the environment connection (stops the Docker container)
         if env is not None:
             try:
                 await env.close()
             except Exception as e:
-                print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True, file=sys.stderr)
+                print(f"[DEBUG] env.close() error: {e}", flush=True, file=sys.stderr)
 
     # ── Aggregate summary ────────────────────────────────────
     print(f"\n{'=' * 60}", flush=True)
