@@ -65,7 +65,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-import httpx
 
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
@@ -146,73 +145,57 @@ def _call_llm(
     temperature: float = 0.7,
 ) -> Optional[str]:
     """
-    Make a single synchronous LLM call to the Hugging Face Router.
+    Make a single synchronous LLM call using the OpenAI client.
+
+    IMPORTANT: Must use the OpenAI client (not raw httpx) so all calls route
+    through the validator's LiteLLM proxy at API_BASE_URL. The validator checks
+    that all LLM traffic goes through their proxy — raw HTTP calls bypass this.
 
     This is the ONLY function that touches the network. It returns:
       - str  → LLM responded successfully, caller should parse the text
-      - None → something went wrong (timeout, HTTP error, parse failure)
+      - None → something went wrong (timeout, auth error, network failure)
 
     Callers decide what to do with None:
-      - reset()  → raise RuntimeError (loud failure, abort episode)
-      - step()   → return reward=0.0, done=True (silent failure, safe exit)
-
-    Uses httpx (sync) because the OpenEnv Environment interface is synchronous.
+      - reset()  → raise RuntimeError (aborts episode, logs score=0)
+      - step()   → return reward=0.0, done=True (safe episode termination)
 
     Args:
-        prompt:        the user message (what we're asking the LLM)
-        system_prompt: the system message (role/instructions for the LLM)
+        prompt:        the user message
+        system_prompt: the system message (role + instructions)
         max_tokens:    max response length in tokens
         temperature:   creativity level (lower = more deterministic)
 
     Returns:
         The LLM's response text, or None if anything went wrong.
     """
-    # ── Guard: no token → skip the network call entirely ──
+    # ── Guard: no API key → cannot authenticate ──
     token = _get_hf_token()
     if not token:
-        logger.warning("HF_TOKEN not set — LLM call cannot proceed")
+        logger.warning("No API key set (HF_TOKEN / API_KEY) — LLM call cannot proceed")
         return None
 
     try:
-        # ── Build the OpenAI-compatible chat completion request ──
-        # The HF Router accepts the same JSON format as OpenAI's API.
-        # "messages" is a list: first the system role, then the user role.
-        response = httpx.post(
-            f"{HF_API_BASE}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
+        # ── Use OpenAI client so calls go through the validator's proxy ──
+        # base_url = API_BASE_URL (validator injects their LiteLLM endpoint)
+        # api_key  = HF_TOKEN or API_KEY (validator injects their key)
+        from openai import OpenAI  # imported here to avoid top-level dep issues
+        openai_client = OpenAI(base_url=HF_API_BASE, api_key=token)
+
+        completion = openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=False,
             timeout=LLM_TIMEOUT,
         )
-        response.raise_for_status()
+        return (completion.choices[0].message.content or "").strip()
 
-        # ── Extract the assistant's reply from the response ──
-        # OpenAI-format: response["choices"][0]["message"]["content"]
-        data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
-
-    except httpx.TimeoutException:
-        logger.warning("LLM call timed out after %.1fs", LLM_TIMEOUT)
-        return None
-    except httpx.HTTPStatusError as e:
-        logger.warning("LLM HTTP error %d", e.response.status_code)
-        return None
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        logger.warning("LLM response parsing failed: %s", e)
-        return None
     except Exception as e:
-        # Catch-all: handles network errors, DNS failures, etc.
-        logger.warning("LLM call failed unexpectedly: %s", e)
+        logger.warning("LLM call failed: %s", e)
         return None
 
 
