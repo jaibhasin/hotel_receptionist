@@ -431,35 +431,59 @@ async def main() -> None:
     # ── Connect to the environment ─────────────────────────────
     # If LOCAL_IMAGE_NAME is set → use Docker (validator mode)
     # If ENV_URL is set → connect directly to a running server (local testing)
+    #
+    # IMPORTANT: from_docker_image() / connect() can raise if the container
+    # fails to start or the server is unreachable. We wrap the entire
+    # connection + task loop in a try/finally so that:
+    #   1. A connection failure is caught and logged (not unhandled)
+    #   2. env.close() is always attempted to clean up Docker containers
+    #   3. Each task still emits [END] via run_task()'s own finally block
     env_url = os.getenv("ENV_URL")
 
-    if LOCAL_IMAGE_NAME:
-        # Validator mode: spin up Docker container with the environment
-        env = await HotelReceptionistEnv.from_docker_image(LOCAL_IMAGE_NAME)
-    elif env_url:
-        # Local testing mode: connect to already-running HF Space or local server
-        env = HotelReceptionistEnv(base_url=env_url)
-        await env.connect()
-    else:
-        print("ERROR: Set LOCAL_IMAGE_NAME (Docker) or ENV_URL (direct connect).", flush=True)
-        print("  For local testing: export ENV_URL='https://jai3-hotel-receptionist.hf.space'", flush=True)
-        sys.exit(1)
-
-    # ── Run each task sequentially ───────────────────────────
-    all_results = []
+    env = None  # initialise so the finally block can safely check it
     try:
+        if LOCAL_IMAGE_NAME:
+            # Validator mode: spin up Docker container with the environment
+            env = await HotelReceptionistEnv.from_docker_image(LOCAL_IMAGE_NAME)
+        elif env_url:
+            # Local testing mode: connect to already-running HF Space or local server
+            env = HotelReceptionistEnv(base_url=env_url)
+            await env.connect()
+        else:
+            print("ERROR: Set LOCAL_IMAGE_NAME (Docker) or ENV_URL (direct connect).", flush=True)
+            print("  For local testing: export ENV_URL='https://jai3-hotel-receptionist.hf.space'", flush=True)
+            sys.exit(1)
+
+        # ── Run each task sequentially ───────────────────────────
+        all_results = []
         for task in TASKS:
             print(f"\n--- Running task: {task['task_id']} ---", flush=True)
             print(f"    {task['description']}", flush=True)
 
             result = await run_task(env, client, task)
             all_results.append(result)
+
+    except SystemExit:
+        # Re-raise sys.exit() calls (e.g. missing env vars) without masking them
+        raise
+    except Exception as conn_exc:
+        # Connection-level failure: env never started, so no tasks ran.
+        # Emit [END] for each task so the harness doesn't stall waiting for output.
+        print(f"[DEBUG] Environment connection failed: {conn_exc}", flush=True, file=sys.stderr)
+        for task in TASKS:
+            log_start(task=task["task_id"], env=BENCHMARK, model=MODEL_NAME)
+            log_end(success=False, steps=0, score=0.0, rewards=[])
+        all_results = [
+            {"task_id": t["task_id"], "score": 0.0, "success": False, "steps": 0, "rewards": []}
+            for t in TASKS
+        ]
     finally:
-        # Always close the environment connection (cleans up Docker container)
-        try:
-            await env.close()
-        except Exception as e:
-            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True, file=sys.stderr)
+        # Always close/clean up the environment connection (stops the Docker container)
+        if env is not None:
+            try:
+                await env.close()
+            except Exception as e:
+                print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True, file=sys.stderr)
 
     # ── Aggregate summary ────────────────────────────────────
     print(f"\n{'=' * 60}", flush=True)
