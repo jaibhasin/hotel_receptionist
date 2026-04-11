@@ -443,8 +443,20 @@ async def main() -> None:
     env = None  # initialise so the finally block can safely check it
     try:
         if LOCAL_IMAGE_NAME:
-            # Validator mode: spin up Docker container with the environment
-            env = await HotelReceptionistEnv.from_docker_image(LOCAL_IMAGE_NAME)
+            # Validator mode: spin up Docker container with the environment.
+            # Forward the validator-injected env vars into the container so the
+            # environment's LLM World Engine routes through the same LiteLLM proxy.
+            # ALL three vars are required: API_BASE_URL sets the proxy endpoint,
+            # HF_TOKEN/API_KEY authenticates, MODEL_NAME selects the model.
+            container_env: dict = {}
+            for var in ("API_BASE_URL", "MODEL_NAME", "HF_TOKEN", "API_KEY"):
+                val = os.getenv(var)
+                if val:
+                    container_env[var] = val
+            env = await HotelReceptionistEnv.from_docker_image(
+                LOCAL_IMAGE_NAME,
+                env_vars=container_env if container_env else None,
+            )
         elif env_url:
             # Local testing mode: connect to already-running HF Space or local server
             env = HotelReceptionistEnv(base_url=env_url)
