@@ -326,7 +326,7 @@ async def run_task(
 
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
+    score = 0.01
     success = False
 
     try:
@@ -368,20 +368,21 @@ async def run_task(
             # If reset failed, log one step with the agent's action and stop.
             # The agent call already went through the proxy, which satisfies the check.
             if reset_failed:
-                rewards.append(0.0)
+                rewards.append(0.01)
                 steps_taken = step
-                log_step(step=step, action=action.action_type, reward=0.0, done=True, error="reset_failed")
+                log_step(step=step, action=action.action_type, reward=0.01, done=True, error="reset_failed")
                 break
 
             # Step the environment via WebSocket → Docker container
             try:
                 result = await env.step(action)
                 obs = result.observation
-                reward = float(result.reward or 0.0)
+                # Clamp reward to strict (0, 1) — validator rejects 0.0 and 1.0
+                reward = min(max(float(result.reward or 0.01), 0.01), 0.99)
                 done = bool(result.done)
                 error = None
             except Exception as step_exc:
-                reward = 0.0
+                reward = 0.01
                 done = True
                 error = str(step_exc)[:80]
 
@@ -400,9 +401,11 @@ async def run_task(
                 break
 
         # ── Compute final score ──────────────────────────────
+        # Validator requires scores strictly in (0, 1) — not 0.0 or 1.0.
+        # Clamp to [0.01, 0.99] so boundary values never slip through.
         actual_steps = len(rewards)
-        score = sum(rewards) / actual_steps if actual_steps > 0 else 0.0
-        score = min(max(score, 0.0), 1.0)
+        score = sum(rewards) / actual_steps if actual_steps > 0 else 0.01
+        score = min(max(score, 0.01), 0.99)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as exc:
@@ -512,14 +515,14 @@ async def main() -> None:
                 try:
                     # This LLM call goes through os.environ["API_BASE_URL"] + os.environ["API_KEY"]
                     action = get_agent_action(client, fake_obs)
-                    log_step(step=1, action=action.action_type, reward=0.0, done=True, error="env_unavailable")
+                    log_step(step=1, action=action.action_type, reward=0.01, done=True, error="env_unavailable")
                 except Exception as llm_exc:
                     print(f"[DEBUG] Fallback LLM call failed: {llm_exc}", flush=True, file=sys.stderr)
-                    log_step(step=1, action="respond", reward=0.0, done=True, error=str(llm_exc)[:80])
+                    log_step(step=1, action="respond", reward=0.01, done=True, error=str(llm_exc)[:80])
 
-                log_end(success=False, steps=1, score=0.0, rewards=[0.0])
+                log_end(success=False, steps=1, score=0.01, rewards=[0.01])
                 all_results.append(
-                    {"task_id": task["task_id"], "score": 0.0, "success": False, "steps": 1, "rewards": [0.0]}
+                    {"task_id": task["task_id"], "score": 0.01, "success": False, "steps": 1, "rewards": [0.01]}
                 )
     finally:
         if env is not None:
