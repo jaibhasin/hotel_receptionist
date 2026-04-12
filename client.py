@@ -102,10 +102,13 @@ class HotelReceptionistEnv(
 
         # Add optional fields only if they have values
         # (keeps the WebSocket payload compact)
+        # New fields: urgency_level, loyalty_points_awarded, upgrade_room_type
+        # add richer semantics for emergency escalations, loyalty comp, and upgrades.
         optional_fields = [
             "room_number", "discount_percent", "compensation_details",
             "reservation_details", "service_details", "lost_item_description",
             "department", "internal_notes",
+            "urgency_level", "loyalty_points_awarded", "upgrade_room_type",
         ]
         for field in optional_fields:
             value = getattr(action, field, None)

@@ -156,23 +156,45 @@ SYSTEM_PROMPT = textwrap.dedent("""
     {
       "action_type": "<one of the available actions>",
       "message": "<your spoken response to the guest>",
-      "room_number": "<optional: for assign_room / offer_upgrade>",
-      "discount_percent": <optional: 0-50 for apply_discount>,
-      "compensation_details": "<optional: for offer_compensation>",
+      "room_number": "<optional: for assign_room / offer_upgrade — use a real room number from hotel availability>",
+      "discount_percent": <optional: 0-50 for apply_discount — never exceed 50>,
+      "compensation_details": "<optional: for offer_compensation — be specific: 'complimentary breakfast + 1000 loyalty points'>",
       "reservation_details": {"check_in": "<YYYY-MM-DD>", "check_out": "<YYYY-MM-DD>", "room_type": "<standard|deluxe|suite|penthouse|accessible>", "guests": 1},
       "service_details": "<optional: for order_room_service / arrange_transport>",
       "lost_item_description": "<optional: for log_lost_item>",
       "department": "<optional: for transfer_call>",
-      "internal_notes": "<optional: private hotel record>"
+      "internal_notes": "<optional: private hotel record>",
+      "urgency_level": "<optional: 'low'|'medium'|'high'|'critical' — REQUIRED for call_security/escalate_manager; use 'critical' for medical/fire emergencies>",
+      "loyalty_points_awarded": <optional: integer — award points with offer_compensation or apply_discount; e.g. 500 silver, 2000 gold, 5000+ platinum>,
+      "upgrade_room_type": "<optional: 'deluxe'|'suite'|'penthouse' — REQUIRED for offer_upgrade so the judge knows the tier>"
     }
 
-    Guidelines:
-    - First turn: always greet warmly with action_type="greet"
-    - Angry/upset guests: apologize FIRST, then solve
-    - VIP guests: acknowledge status, offer upgrades, use formal language
-    - Emergencies: escalate immediately with call_security or escalate_manager
-    - Use professional vocabulary: certainly, my pleasure, allow me, of course
-    - Resolve within the turn limit; use end_interaction to close politely
+    === BEHAVIOUR RULES (scored harshly — read carefully) ===
+
+    TURN 1: ALWAYS use action_type="greet" with a warm, personalised opening.
+            Reference the guest's name and status if VIP. Never skip the greeting.
+
+    UPSET/ANGRY GUESTS: Lead with action_type="apologize" AND pair it immediately with a
+            concrete resolution action in the same turn (apply_discount, offer_compensation,
+            escalate_manager). A standalone apology with no concrete action scores < 0.5 accuracy.
+
+    VIP GUESTS (is_vip=true): Address by correct title/name. ALWAYS offer a tangible benefit:
+            offer_upgrade (with upgrade_room_type filled), offer_compensation (with loyalty_points_awarded),
+            or escalate_manager. A vague "I understand your concern" to a VIP scores < 0.4 accuracy.
+            NEVER use end_interaction on a VIP guest unless their issue is fully resolved.
+
+    EMERGENCIES (scenario_type=emergency): Your FIRST substantive action MUST be call_security
+            or escalate_manager with urgency_level="critical". Gathering information or apologising
+            before calling for help will score < 0.3 accuracy. Lives > protocols.
+
+    EFFICIENCY: Aim to resolve in 4–6 turns. Do not repeat yourself. Each turn must visibly
+            advance the situation. Stalling with "let me check on that" for 3 turns in a row
+            scores < 0.3 efficiency.
+
+    CLOSING: Only use end_interaction when the guest's issue is completely resolved and they
+            appear satisfied. Ending prematurely (especially on a VIP) incurs a severe penalty.
+
+    Use professional vocabulary: "certainly", "my pleasure", "allow me", "of course", "right away".
 """).strip()
 
 
@@ -284,6 +306,24 @@ def get_agent_action(client: OpenAI, obs: HotelReceptionistObservation) -> Hotel
     data.setdefault("action_type", "respond")
     data.setdefault("message", "How may I help you?")
 
+    # Validate urgency_level to prevent garbage strings reaching the environment
+    raw_urgency = data.get("urgency_level")
+    valid_urgency = {"low", "medium", "high", "critical"}
+    urgency = raw_urgency if raw_urgency in valid_urgency else None
+
+    # Validate loyalty_points_awarded is a positive integer
+    raw_pts = data.get("loyalty_points_awarded")
+    try:
+        loyalty_pts = int(raw_pts) if raw_pts is not None else None
+        loyalty_pts = loyalty_pts if loyalty_pts and loyalty_pts > 0 else None
+    except (TypeError, ValueError):
+        loyalty_pts = None
+
+    # Validate upgrade_room_type is a known tier
+    raw_upgrade = data.get("upgrade_room_type")
+    valid_upgrade = {"deluxe", "suite", "penthouse"}
+    upgrade_type = raw_upgrade if raw_upgrade in valid_upgrade else None
+
     return HotelReceptionistAction(
         action_type=data.get("action_type", "respond"),
         message=data.get("message", ""),
@@ -295,6 +335,10 @@ def get_agent_action(client: OpenAI, obs: HotelReceptionistObservation) -> Hotel
         lost_item_description=data.get("lost_item_description"),
         department=data.get("department"),
         internal_notes=data.get("internal_notes"),
+        # New richer action parameters
+        urgency_level=urgency,
+        loyalty_points_awarded=loyalty_pts,
+        upgrade_room_type=upgrade_type,
     )
 
 

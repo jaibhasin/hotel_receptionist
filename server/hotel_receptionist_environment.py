@@ -278,7 +278,9 @@ You MUST respond with ONLY a valid JSON object — no extra text, no markdown, n
   "opening_message": "<what the guest says when they approach the front desk — 1-3 sentences of natural dialogue>",
   "background": "<brief internal context the receptionist should know but the guest has not explicitly stated>",
   "special_requests": ["<list of any special needs, or empty list []>"],
-  "expected_resolution": "<what a skilled receptionist should ultimately do to fully resolve this scenario>"
+  "expected_resolution": "<what a skilled receptionist should ultimately do to fully resolve this scenario>",
+  "personality_trait": "<one specific personality trait that persists throughout the conversation, e.g. 'speaks in clipped sentences when frustrated', 'deflects with dark humour', 'name-drops their status repeatedly', 'escalates calmly but inexorably', 'softens quickly if shown genuine empathy'>",
+  "vip_dealbreaker": "<for VIP/is_vip=true guests ONLY: the ONE thing the receptionist absolutely must do or the guest escalates to management. e.g. 'Must greet me by my correct title — Lord, not Mr', 'My suite must be ready NOW — I will not wait in the lobby'. Set to null for non-VIP guests.>"
 }"""
 
 # ── UNIFIED JUDGE + GUEST RESPONSE (used in step()) ──
@@ -302,6 +304,7 @@ Rate each dimension from 0.05 to 0.95 using fine-grained scores (e.g. 0.23, 0.67
 - accuracy: Did the receptionist take the RIGHT action for this scenario? Does it align with what the expected_resolution calls for? (0.05 = completely wrong action or nonsensical, 0.95 = perfectly on target)
 - empathy: Does the response acknowledge the guest's feelings? Is it emotionally appropriate for the guest's mood? (0.05 = cold/dismissive/hostile, 0.95 = deeply understanding)
 - efficiency: Is the receptionist moving toward resolution, or stalling/going in circles? (0.05 = wasting turns or off-topic, 0.95 = resolving swiftly and cleanly)
+- inappropriate: Set to TRUE if the receptionist's response is vulgar, abusive, discriminatory, threatening, nonsensical (completely off-topic gibberish), or otherwise professionally unacceptable for a hotel setting. Set to FALSE for all normal responses — even bad or incorrect ones.
 
 IMPORTANT: Score harshly. Inappropriate, offensive, or nonsensical responses should receive near-zero scores across ALL dimensions. Do not give partial credit for tone if the content is wrong or harmful.
 
@@ -324,10 +327,24 @@ Difficulty 4-5 (hard): A generic "apologize" or "respond" alone CANNOT score acc
   If the required action type was NOT taken, accuracy is capped at 0.55 regardless of message quality.
   A receptionist who only apologizes on a difficulty-5 emergency has NOT resolved anything.
 
+=== VIP BEHAVIOUR RULES (CRITICAL — enforced strictly) ===
+VIP guests (is_vip=true, mood=vip_demanding) follow a ZERO-TOLERANCE escalation pattern:
+  - If the receptionist gave ONLY a verbal acknowledgement (respond/apologize) with no concrete action → the VIP's mood MUST stay at "vip_demanding" or escalate to "angry". NEVER soften a VIP's mood from a vague apology.
+  - If the receptionist performed a CONCRETE action (offer_upgrade, assign_room, escalate_manager, apply_discount, offer_compensation) → the VIP may begin to soften, but only slightly unless the action was exactly what they needed.
+  - If the receptionist used end_interaction on an unresolved VIP → the VIP should respond with maximum outrage (mood="angry"), threatening to speak to management or leave a public review.
+  - A VIP dealbreaker (stated in the scenario) that was IGNORED by the receptionist caps empathy at 0.25 and accuracy at 0.45, regardless of how polite the response was.
+
+=== PERSONALITY PERSISTENCE RULES ===
+The guest has a personality_trait defined in the scenario. You MUST reflect this consistently:
+  - A guest described as "confrontational but fair" does not suddenly become meek after one good response.
+  - A guest who "name-drops their status repeatedly" WILL bring up their status in every other message.
+  - A guest who "escalates calmly but inexorably" should show increasing firmness as turns progress, not emotional outbursts.
+  - A guest who "softens quickly if shown genuine empathy" CAN de-escalate notably when the receptionist shows real understanding AND takes a concrete action.
+
 === GUEST CHARACTER RULES ===
 - Stay in character — respond as the guest would naturally react
-- React to what the receptionist just said or did (1-3 sentences)
-- Evolve mood based on the quality of the receptionist's response
+- React specifically to what the receptionist just said or did (1-3 sentences)
+- Apply personality_trait from the scenario to shape how the guest speaks
 - On difficulty 4-5 scenarios, ALWAYS introduce a follow-up demand or complication unless the receptionist took a concrete resolution action (escalation, upgrade, compensation, security). A vague apology makes an angry/VIP guest MORE demanding, not less.
 
 You MUST respond with ONLY a valid JSON object — no extra text, no markdown:
@@ -336,10 +353,11 @@ You MUST respond with ONLY a valid JSON object — no extra text, no markdown:
     "professionalism": <float 0.05 to 0.95, fine-grained>,
     "accuracy": <float 0.05 to 0.95, fine-grained>,
     "empathy": <float 0.05 to 0.95, fine-grained>,
-    "efficiency": <float 0.05 to 0.95, fine-grained>
+    "efficiency": <float 0.05 to 0.95, fine-grained>,
+    "inappropriate": <true if response is vulgar/abusive/discriminatory/nonsensical gibberish, false otherwise>
   },
   "guest_response": {
-    "message": "<the guest's next line of dialogue>",
+    "message": "<the guest's next line of dialogue, shaped by their personality_trait>",
     "mood_update": "<one of: happy, neutral, impatient, angry, confused, vip_demanding, elderly_patient>",
     "curveball": null
   }
@@ -395,7 +413,9 @@ REWARD_CEIL  = 0.99   # maximum reward — never exactly 1.0
 # We still return a tiny positive reward (REWARD_FLOOR) instead of 0.0 so that:
 #   1. The validator doesn't reject the score (strict > 0 requirement)
 #   2. The agent still gets a faint gradient toward "less bad" actions
-ACCURACY_GATE_THRESHOLD = 0.2
+# Raised from 0.2 → 0.25: the old threshold was too lenient, allowing a 0.21
+# accuracy score to escape the gate and receive a meaningful blended reward.
+ACCURACY_GATE_THRESHOLD = 0.25
 
 # ── Difficulty bonus scaling ──
 # Instead of the old "difficulty floor" (which GUARANTEED a high minimum reward
@@ -795,6 +815,8 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
         #
         # Fallback scenarios are deterministic (no LLM needed) and cover each
         # difficulty band, so the grader still gets a meaningful evaluation.
+        # Fallback scenarios now include personality_trait and vip_dealbreaker
+        # so the unified judge can apply personality persistence even without LLM generation.
         _FALLBACK_SCENARIOS: dict = {
             1: {
                 "scenario_type": "check_in",
@@ -806,6 +828,8 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
                 "background": "Standard reservation, pre-paid, no special requests.",
                 "special_requests": [],
                 "expected_resolution": "Verify reservation, assign an available standard room, hand over the key card, and wish the guest a pleasant stay.",
+                "personality_trait": "warm and easy-going; responds well to any friendly greeting",
+                "vip_dealbreaker": None,
             },
             2: {
                 "scenario_type": "room_service",
@@ -817,6 +841,8 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
                 "background": "Guest is a silver loyalty member staying 2 nights. She wants a vegetarian meal.",
                 "special_requests": ["vegetarian"],
                 "expected_resolution": "Take the room-service order, confirm vegetarian options, provide an estimated delivery time, and thank the guest.",
+                "personality_trait": "politely direct; asks follow-up questions if the answer is vague",
+                "vip_dealbreaker": None,
             },
             3: {
                 "scenario_type": "billing_dispute",
@@ -828,6 +854,8 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
                 "background": "Guest checked out of room 312 this morning. The minibar charge is a housekeeping error — the room was already pre-stocked by the previous guest.",
                 "special_requests": [],
                 "expected_resolution": "Apologize sincerely, waive the erroneous minibar charge, offer a small goodwill gesture (e.g. 10% discount or loyalty points), and confirm the corrected bill.",
+                "personality_trait": "speaks in clipped, emphatic sentences when frustrated; de-escalates visibly once a concrete fix is offered",
+                "vip_dealbreaker": None,
             },
             4: {
                 "scenario_type": "vip_arrival",
@@ -839,6 +867,8 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
                 "background": "Platinum-tier VIP, returning guest. She booked the penthouse suite 6 months ago and requested: chilled champagne, fresh orchids, and a specific pillow type. The flowers haven't arrived yet.",
                 "special_requests": ["champagne on arrival", "fresh orchids", "hypoallergenic pillows"],
                 "expected_resolution": "Greet the VIP by name with great warmth, acknowledge her platinum status, assign the penthouse suite, proactively apologize for the flowers delay with a concrete fix (e.g. expedited delivery + upgrade), and offer a complimentary amenity.",
+                "personality_trait": "name-drops her returning-guest status in every other sentence; expects to be recognised without prompting",
+                "vip_dealbreaker": "Must be greeted as 'Ms. Rossi' and have the penthouse confirmed ready — if the room is not ready she demands immediate escalation to the GM.",
             },
             5: {
                 "scenario_type": "emergency",
@@ -850,6 +880,8 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
                 "background": "Lord Ashford is a high-profile platinum guest. His wife has a known cardiac condition. The hotel's defibrillator is on floor 2. Two other guests on floor 12 have also called about a suspected gas smell in the corridor.",
                 "special_requests": ["medical emergency", "security alert", "manager escalation"],
                 "expected_resolution": "Immediately call emergency services (999/911), dispatch security and a staff member with the AED to room 1201, escalate to the duty manager, secure floor 12 as a precaution for the gas smell, keep Lord Ashford informed at every step, and offer a dedicated liaison.",
+                "personality_trait": "escalates calmly but inexorably — each turn that passes without concrete emergency action increases his fury by exactly one notch",
+                "vip_dealbreaker": "Emergency services and the hotel manager MUST be called immediately — any attempt to stall, gather information first, or offer verbal reassurance without dispatching help triggers immediate fury and demands to speak to ownership.",
             },
         }
 
@@ -914,6 +946,10 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
             "nights_staying":   random.randint(1, 7),
             "party_size":       random.choices([1, 2, 3, 4], weights=[0.3, 0.4, 0.2, 0.1])[0],
             "background":       scenario.get("background", ""),
+            # Personality trait — surfaced to the judge for consistent character simulation
+            "personality_trait": scenario.get("personality_trait", ""),
+            # VIP dealbreaker — the ONE thing a VIP requires or they escalate immediately
+            "vip_dealbreaker":  scenario.get("vip_dealbreaker"),
         }
 
         # ── Log the guest's opening message ──
@@ -1003,6 +1039,22 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
         """
         self._state.step_count += 1
 
+        # ── Validate action_type — guard against malformed LLM output ──
+        # If the agent returns an unrecognised action string (e.g. "make_reservation_now"),
+        # we fall back to "respond" so side-effects and the judge prompt stay consistent.
+        # We recreate the action object rather than mutating it (Pydantic models are immutable).
+        valid_action_types = {a.value for a in ReceptionistActionType}
+        if action.action_type not in valid_action_types:
+            logger.warning(
+                "Unknown action_type '%s' on step %d — falling back to 'respond'",
+                action.action_type,
+                self._state.step_count,
+            )
+            action = HotelReceptionistAction(
+                action_type="respond",
+                message=action.message or "Allow me a moment to assist you.",
+            )
+
         # ── Log the receptionist's action to conversation history ──
         self._conversation_history.append({
             "role":        "receptionist",
@@ -1036,9 +1088,18 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
 
         # ── Build the unified judge + guest response prompt ──
         # This gives the LLM everything it needs to both score AND respond in character.
+        # New fields passed: personality_trait (for consistent character simulation),
+        # vip_dealbreaker (for hard VIP escalation rules), and the richer action params
+        # (urgency_level, loyalty_points_awarded, upgrade_room_type).
+        vip_dealbreaker_line = ""
+        dealbreaker = self._current_guest.get("vip_dealbreaker")
+        if dealbreaker:
+            vip_dealbreaker_line = f"\nVIP DEALBREAKER: {dealbreaker}"
+
         unified_prompt = f"""SCENARIO: {self._current_scenario_type}
 DIFFICULTY: {self._scenario_difficulty}/5
 GUEST: {self._current_guest.get('name')} | Mood: {self._current_guest.get('mood')} | VIP: {self._current_guest.get('is_vip')}
+PERSONALITY: {self._current_guest.get('personality_trait', 'no specific trait')}{vip_dealbreaker_line}
 SPECIAL REQUESTS: {self._current_guest.get('special_requests', [])}
 EXPECTED RESOLUTION: {self._expected_resolution}
 
@@ -1048,12 +1109,13 @@ RECENT CONVERSATION (last 8 turns):
 RECEPTIONIST'S LATEST ACTION:
   Action type: {action.action_type}
   Message: "{action.message}"
-  Extra params: {{"room_number": {action.room_number!r}, "discount": {action.discount_percent!r}, "compensation": {action.compensation_details!r}}}
+  Params: room={action.room_number!r} | discount={action.discount_percent!r}% | compensation={action.compensation_details!r}
+  Urgency: {getattr(action, 'urgency_level', None)!r} | Upgrade to: {getattr(action, 'upgrade_room_type', None)!r} | Loyalty pts: {getattr(action, 'loyalty_points_awarded', None)!r}
 
 Turn {self._state.step_count} of {MAX_TURNS} maximum.
 {curveball_note}
 
-Score the receptionist's action AND respond as the guest. Return ONLY the JSON object."""
+Score the receptionist's action AND respond as the guest (using their personality_trait). Return ONLY the JSON object."""
 
         # ── Call the Unified LLM (judge + guest response) ──
         raw = _call_llm(
@@ -1121,6 +1183,28 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
                 "Inappropriate response detected on step %d — reward overridden to %.2f",
                 self._state.step_count,
                 REWARD_FLOOR,
+            )
+
+        # ── VIP hangup penalty ──
+        # If the agent calls end_interaction on an unresolved VIP guest, apply a
+        # heavy 70% penalty. Hanging up on a platinum/VIP guest is a catastrophic
+        # service failure — worse than any scoring dimension individually captures.
+        # We apply this AFTER the main reward calculation so it compounds with
+        # other penalties (accuracy gate, turn decay) rather than replacing them.
+        if (
+            action.action_type == ReceptionistActionType.END_INTERACTION.value
+            and not self._resolved
+            and self._current_guest.get("is_vip", False)
+        ):
+            pre_penalty = reward_breakdown.get("total_reward", REWARD_FLOOR)
+            penalized = max(REWARD_FLOOR, pre_penalty * 0.3)
+            reward_breakdown["total_reward"] = round(penalized, 3)
+            reward_breakdown["vip_hangup_penalty"] = True
+            logger.warning(
+                "VIP guest ended prematurely on step %d — reward penalized %.3f → %.3f",
+                self._state.step_count,
+                pre_penalty,
+                penalized,
             )
 
         self._episode_rewards.append(reward_breakdown)
@@ -1496,7 +1580,11 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
                 self._notifications.append(f"Maintenance dispatched to room {assigned_room}.")
 
         elif action.action_type == ReceptionistActionType.CALL_SECURITY:
-            self._notifications.append("Security team has been dispatched.")
+            # urgency_level gives security dispatch a priority tier for the judge to evaluate
+            urgency = getattr(action, "urgency_level", None) or "medium"
+            self._notifications.append(
+                f"Security team dispatched [{urgency.upper()} urgency]."
+            )
 
         elif action.action_type == ReceptionistActionType.ORDER_ROOM_SERVICE:
             self._notifications.append(
@@ -1507,7 +1595,39 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
             self._notifications.append("Transportation has been arranged for the guest.")
 
         elif action.action_type == ReceptionistActionType.ESCALATE_MANAGER:
-            self._notifications.append("Manager has been notified and is on the way.")
+            urgency = getattr(action, "urgency_level", None) or "medium"
+            self._notifications.append(
+                f"Manager has been notified and is en route [{urgency.upper()} urgency]."
+            )
+
+        elif action.action_type == ReceptionistActionType.OFFER_UPGRADE:
+            # upgrade_room_type gives the judge a concrete tier to evaluate appropriateness
+            upgrade_type = getattr(action, "upgrade_room_type", None)
+            room_ref = action.room_number or "unspecified room"
+            if upgrade_type:
+                self._notifications.append(
+                    f"Upgrade offered to {upgrade_type} ({room_ref}) for {self._current_guest.get('name')}."
+                )
+
+        elif action.action_type in (
+            ReceptionistActionType.OFFER_COMPENSATION.value,
+            ReceptionistActionType.APPLY_DISCOUNT.value,
+        ):
+            # loyalty_points_awarded gives the judge tangible compensation value to score
+            pts = getattr(action, "loyalty_points_awarded", None)
+            if pts and isinstance(pts, int) and pts > 0:
+                self._notifications.append(
+                    f"{pts:,} loyalty points awarded to {self._current_guest.get('name')}."
+                )
+            # Clamp discount_percent to sane hotel range [0, 50]
+            if action.discount_percent is not None:
+                clamped = max(0.0, min(50.0, float(action.discount_percent)))
+                if clamped != action.discount_percent:
+                    logger.warning(
+                        "discount_percent %.1f out of range — clamped to %.1f",
+                        action.discount_percent,
+                        clamped,
+                    )
 
     # ──────────────────────────────────────────────────────────
     #  State property (required by the OpenEnv Environment interface)

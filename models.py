@@ -252,6 +252,34 @@ class HotelReceptionistAction(Action):
         description="Private notes for hotel records (not shown to guest)"
     )
 
+    # ── NEW: Richer action parameters ────────────────────────────────────────
+    # These fields increase the expressive power of the agent's actions and give
+    # the LLM judge concrete details to evaluate rather than guessing intent.
+
+    urgency_level: Optional[str] = Field(
+        default=None,
+        description=(
+            "Urgency level for CALL_SECURITY or ESCALATE_MANAGER actions. "
+            "Values: 'low', 'medium', 'high', 'critical'. "
+            "Use 'critical' for active medical/fire emergencies."
+        )
+    )
+    loyalty_points_awarded: Optional[int] = Field(
+        default=None,
+        description=(
+            "Loyalty points to award guest as part of OFFER_COMPENSATION or "
+            "APPLY_DISCOUNT resolution. E.g. 500 (silver), 2000 (gold), 5000 (platinum)."
+        )
+    )
+    upgrade_room_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "Target room type when using OFFER_UPGRADE. "
+            "Values: 'deluxe', 'suite', 'penthouse'. "
+            "Must be higher tier than the guest's current room."
+        )
+    )
+
 
 # ──────────────────────────────────────────────────────────────
 #  Observation — what the LLM receives from the environment
