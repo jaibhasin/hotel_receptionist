@@ -63,8 +63,9 @@ from models import HotelReceptionistAction, HotelReceptionistObservation
 # The validator overwrites these with their own proxy + model.
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
-# Accept either HF_TOKEN or API_KEY — validator may inject either
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+# Grader injects API_KEY at runtime — always prefer it over HF_TOKEN
+# HF_TOKEN is only used as a fallback for local testing
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 # Environment / benchmark label used in [START] log lines

@@ -129,13 +129,13 @@ def _get_hf_token() -> Optional[str]:
     """
     Retrieve the API key from environment variables.
 
-    Checks HF_TOKEN first (hackathon standard), then API_KEY as fallback.
+    Checks API_KEY first (grader injects this at runtime), then HF_TOKEN as fallback for local testing.
     The validator injects one of these; the environment must not hardcode credentials.
 
     Returns:
         Token string, or None if neither variable is set.
     """
-    return os.environ.get("HF_TOKEN") or os.environ.get("API_KEY")
+    return os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
 
 
 def _call_llm(
