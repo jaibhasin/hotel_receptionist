@@ -258,10 +258,9 @@ def get_agent_action(client: OpenAI, obs: HotelReceptionistObservation) -> Hotel
         )
         raw = (completion.choices[0].message.content or "").strip()
     except Exception as exc:
-        print(f"[DEBUG] LLM call failed: {exc}", flush=True, file=sys.stderr)
-        # Safe fallback so the episode keeps running
-        raw = json.dumps({"action_type": "respond",
-                          "message": "I apologize for the delay. Let me assist you right away."})
+        # DO NOT silently swallow — let the grader see the real proxy error
+        print(f"[FATAL] LLM call failed: {exc}", flush=True, file=sys.stderr)
+        raise
 
     # Parse the LLM's JSON response (handles markdown fences and extra text)
     text = raw
