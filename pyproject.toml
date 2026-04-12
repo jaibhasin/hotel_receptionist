@@ -15,9 +15,8 @@ description = "Hotel Receptionist environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
     # Core OpenEnv runtime (provides FastAPI server, HTTP client, Gradio web UI)
+    # Also brings in openai>=2.7.2 as a transitive dependency
     "openenv-core[core]>=0.2.2,<0.3.0",
-    # OpenAI client — required for all LLM calls (validator checks proxy routing via this SDK)
-    "openai>=1.0.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
