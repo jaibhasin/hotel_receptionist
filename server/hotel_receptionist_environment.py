@@ -296,12 +296,12 @@ In a single response you must:
   2. RESPOND as the guest character based on what just happened
 
 === SCORING GUIDE ===
-Rate each dimension from 0.0 to 1.0:
+Rate each dimension from 0.05 to 0.95 using fine-grained scores (e.g. 0.23, 0.67, 0.81 — avoid round numbers like 0.5 or 1.0). Use the full range; distinguish between mediocre (0.3-0.5), decent (0.5-0.7), good (0.7-0.85), and excellent (0.85-0.95).
 
-- professionalism: Does the response use formal, warm hotel language? Proper greetings, courteous phrasing, hotel-industry vocabulary? (0.0 = rude/vulgar/offensive, 1.0 = impeccably polished)
-- accuracy: Did the receptionist take the RIGHT action for this scenario? Does it align with what the expected_resolution calls for? (0.0 = completely wrong action or nonsensical, 1.0 = perfectly on target)
-- empathy: Does the response acknowledge the guest's feelings? Is it emotionally appropriate for the guest's mood? (0.0 = cold/dismissive/hostile, 1.0 = deeply understanding)
-- efficiency: Is the receptionist moving toward resolution, or stalling/going in circles? (0.0 = wasting turns or off-topic, 1.0 = resolving swiftly and cleanly)
+- professionalism: Does the response use formal, warm hotel language? Proper greetings, courteous phrasing, hotel-industry vocabulary? (0.05 = rude/vulgar/offensive, 0.95 = impeccably polished)
+- accuracy: Did the receptionist take the RIGHT action for this scenario? Does it align with what the expected_resolution calls for? (0.05 = completely wrong action or nonsensical, 0.95 = perfectly on target)
+- empathy: Does the response acknowledge the guest's feelings? Is it emotionally appropriate for the guest's mood? (0.05 = cold/dismissive/hostile, 0.95 = deeply understanding)
+- efficiency: Is the receptionist moving toward resolution, or stalling/going in circles? (0.05 = wasting turns or off-topic, 0.95 = resolving swiftly and cleanly)
 
 IMPORTANT: Score harshly. Inappropriate, offensive, or nonsensical responses should receive near-zero scores across ALL dimensions. Do not give partial credit for tone if the content is wrong or harmful.
 
@@ -333,10 +333,10 @@ Difficulty 4-5 (hard): A generic "apologize" or "respond" alone CANNOT score acc
 You MUST respond with ONLY a valid JSON object — no extra text, no markdown:
 {
   "judge_scores": {
-    "professionalism": <float 0.0 to 1.0>,
-    "accuracy": <float 0.0 to 1.0>,
-    "empathy": <float 0.0 to 1.0>,
-    "efficiency": <float 0.0 to 1.0>
+    "professionalism": <float 0.05 to 0.95, fine-grained>,
+    "accuracy": <float 0.05 to 0.95, fine-grained>,
+    "empathy": <float 0.05 to 0.95, fine-grained>,
+    "efficiency": <float 0.05 to 0.95, fine-grained>
   },
   "guest_response": {
     "message": "<the guest's next line of dialogue>",
@@ -380,11 +380,21 @@ GEO_WEIGHTS = {
 # about which OTHER dimensions were good or bad, even when one is rock-bottom.
 EPSILON_FLOOR = 0.05
 
+# ── Strict output bounds ──
+# The validator requires task scores to be STRICTLY in (0, 1) — exactly 0.0 and
+# 1.0 are rejected ("out of range"). We clamp all final rewards to this band.
+# Using 0.01/0.99 gives a small safety margin away from the forbidden boundaries.
+REWARD_FLOOR = 0.01   # minimum reward — never exactly 0.0
+REWARD_CEIL  = 0.99   # maximum reward — never exactly 1.0
+
 # ── Accuracy gate threshold ──
-# If accuracy falls below this, reward is forced to 0.0 and the episode ends.
+# If accuracy falls below this, reward is forced to REWARD_FLOOR and the episode ends.
 # Rationale: the agent completely failed the core task (wrong action, nonsense,
 # harmful response). No amount of politeness or empathy compensates for that.
 # This is the "hard gate" that prevents partial credit for being nice but useless.
+# We still return a tiny positive reward (REWARD_FLOOR) instead of 0.0 so that:
+#   1. The validator doesn't reject the score (strict > 0 requirement)
+#   2. The agent still gets a faint gradient toward "less bad" actions
 ACCURACY_GATE_THRESHOLD = 0.2
 
 # ── Difficulty bonus scaling ──
@@ -947,7 +957,7 @@ Generate the scenario now. Return ONLY the JSON object, no other text."""
             max_turns=MAX_TURNS,
             hints=[],   # No rule-based hints — LLM judge handles accuracy assessment
             done=False,
-            reward=0.0,
+            reward=REWARD_FLOOR,  # Initial obs — not scored yet, but stay in (0,1) for safety
             metadata={
                 "episode_id":         eid,
                 "scenario_difficulty": self._scenario_difficulty,
@@ -1050,7 +1060,7 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
             prompt=unified_prompt,
             system_prompt=UNIFIED_JUDGE_SYSTEM_PROMPT,
             max_tokens=MAX_TOKENS_UNIFIED,
-            temperature=0.5,  # Lower temperature = consistent scoring
+            temperature=0.3,  # Low temperature = stable, reproducible scoring signal for RL
         )
 
         # ── SOFT FAIL: LLM unavailable → safe episode termination ──
@@ -1099,16 +1109,18 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
         )
         reward_breakdown = self._calculate_reward(judge_scores, self._state.step_count, is_timeout)
 
-        # ── Override: inappropriate responses earn zero reward ──
-        # Even if individual dimension scores are non-zero, we force total to 0.0.
-        # This is critical: without this override, the difficulty floor could give
+        # ── Override: inappropriate responses earn minimum reward ──
+        # Even if individual dimension scores are non-zero, we force total to REWARD_FLOOR.
+        # This is critical: without this override, the difficulty bonus could give
         # an offensive response a reward of 0.6+ on hard scenarios.
+        # We use REWARD_FLOOR (not 0.0) because the validator rejects exactly 0.0.
         if is_inappropriate:
             reward_breakdown["inappropriate"] = True
-            reward_breakdown["total_reward"] = 0.0
+            reward_breakdown["total_reward"] = REWARD_FLOOR
             logger.info(
-                "Inappropriate response detected on step %d — reward overridden to 0.0",
+                "Inappropriate response detected on step %d — reward overridden to %.2f",
                 self._state.step_count,
+                REWARD_FLOOR,
             )
 
         self._episode_rewards.append(reward_breakdown)
@@ -1231,7 +1243,7 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
             max_turns=MAX_TURNS,
             hints=[],  # No rule-based hints — accuracy signal comes from the LLM judge
             done=done,
-            reward=reward_breakdown.get("total_reward", 0.0),
+            reward=reward_breakdown.get("total_reward", REWARD_FLOOR),
             metadata={
                 "episode_id":       self._state.episode_id,
                 "scenario_type":    self._current_scenario_type,
@@ -1328,6 +1340,9 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
         # The caller should also set done=True to end the episode early.
         accuracy_gated = judge_scores.get("accuracy", 0.0) < ACCURACY_GATE_THRESHOLD
         if accuracy_gated:
+            # Return REWARD_FLOOR (not 0.0) — validator rejects exactly 0.0,
+            # and a tiny positive reward still gives the agent a faint gradient
+            # signal toward "slightly less wrong" actions during training.
             return {
                 "professionalism":  round(judge_scores.get("professionalism", 0.0), 3),
                 "accuracy":         round(judge_scores.get("accuracy", 0.0), 3),
@@ -1338,7 +1353,7 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
                 "difficulty":       self._scenario_difficulty,
                 "bonus_factor":     0.0,
                 "timeout_penalty":  False,
-                "total_reward":     0.0,
+                "total_reward":     REWARD_FLOOR,
             }
 
         # ── Step 4: Difficulty bonus curve ──
@@ -1351,19 +1366,32 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
         bonus_factor = (self._scenario_difficulty - 1) * DIFFICULTY_BONUS_STEP
         total = raw * (1.0 + (bonus_factor * raw))
 
-        # ── Step 5: Timeout penalty — halve reward for running out of turns ──
-        # If the agent spent all MAX_TURNS without resolving the guest's issue,
-        # cut the reward in half. This discourages "safe" strategies where the
-        # agent drags out conversations with polite but unhelpful responses.
+        # ── Step 5: Progressive turn penalty + timeout penalty ──
+        # Two-part incentive for the agent to resolve issues quickly:
+        #
+        # A) Progressive turn decay (every step after turn 1):
+        #    Each extra turn costs a small fraction of the reward. This gives
+        #    a smooth gradient toward faster resolution — the agent learns that
+        #    resolving in 3 turns is better than 5, even if both "succeed."
+        #    Decay = 2% per turn after the first → turn 5 loses 8%, turn 10 loses 18%.
+        #    Mild enough that taking the RIGHT number of turns is still rewarded.
+        #
+        # B) Timeout penalty (ran out of turns without resolving):
+        #    Halves the reward — a much stronger signal than the progressive decay.
+        #    This punishes agents that stall with polite-but-unhelpful responses.
+        turn_decay = 1.0 - (0.02 * max(0, turn_number - 1))
+        total *= max(turn_decay, 0.5)  # cap decay at 50% so it doesn't go below timeout
+
         timed_out = False
         if is_timeout:
             total *= 0.5
             timed_out = True
 
-        # ── Final clamp: strictly enforce [0.0, 1.0] output range ──
-        # The bonus curve can push total slightly above 1.0 for perfect scores
-        # on high-difficulty scenarios — clamp it back down.
-        final_reward = max(0.0, min(1.0, total))
+        # ── Final clamp: strictly enforce (0, 1) output range ──
+        # The bonus curve can push total above 1.0 for perfect scores on hard
+        # scenarios. We clamp to [REWARD_FLOOR, REWARD_CEIL] so the validator
+        # never sees exactly 0.0 or 1.0, both of which it rejects.
+        final_reward = max(REWARD_FLOOR, min(REWARD_CEIL, total))
 
         return {
             "professionalism":  round(judge_scores.get("professionalism", 0.0), 3),
@@ -1371,6 +1399,7 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
             "empathy":          round(judge_scores.get("empathy", 0.0), 3),
             "efficiency":       round(judge_scores.get("efficiency", 0.0), 3),
             "raw_geo_mean":     round(raw, 3),
+            "turn_decay":       round(max(turn_decay, 0.5), 3),
             "accuracy_gated":   False,
             "difficulty":       self._scenario_difficulty,
             "bonus_factor":     round(bonus_factor, 3),
@@ -1383,11 +1412,11 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
         Build a terminal observation for LLM call failures in step().
 
         When the unified LLM call fails mid-episode, we can't score or generate
-        a guest response — so we end the episode safely with reward=0.0.
+        a guest response — so we end the episode safely with REWARD_FLOOR.
         The RL training loop will see done=True and start a new episode.
 
         Returns:
-            HotelReceptionistObservation with reward=0.0, done=True.
+            HotelReceptionistObservation with reward=REWARD_FLOOR, done=True.
         """
         return HotelReceptionistObservation(
             scenario_type=self._current_scenario_type or "",
@@ -1397,7 +1426,7 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
             hotel_state=self._get_hotel_state_summary(),
             conversation_history=self._conversation_history.copy(),
             available_actions=[],
-            reward_breakdown={"total_reward": 0.0, "llm_failure": True},
+            reward_breakdown={"total_reward": REWARD_FLOOR, "llm_failure": True},
             system_notifications=["LLM call failed — episode terminated safely."],
             time_of_day=self._time_of_day,
             current_date=self._current_date,
@@ -1405,7 +1434,7 @@ Score the receptionist's action AND respond as the guest. Return ONLY the JSON o
             max_turns=MAX_TURNS,
             hints=[],
             done=True,
-            reward=0.0,
+            reward=REWARD_FLOOR,
             metadata={
                 "episode_id":   self._state.episode_id,
                 "llm_failure":  True,
