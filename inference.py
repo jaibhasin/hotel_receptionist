@@ -51,21 +51,22 @@ from models import HotelReceptionistAction, HotelReceptionistObservation
 
 
 # ──────────────────────────────────────────────────────────────
-#  Configuration — env vars set by judges during validation
+#  Configuration — THE NUCLEAR OPTION: No fallbacks.
+#
+#  The grader MUST inject API_BASE_URL and API_KEY at runtime.
+#  If either is missing, we crash immediately so the error is
+#  visible in the validator log — no silent degradation.
 # ──────────────────────────────────────────────────────────────
+API_BASE_URL = os.environ.get("API_BASE_URL")
+API_KEY = os.environ.get("API_KEY")
 
-# Env vars exactly as specified in the pre-submission checklist:
-#   API_BASE_URL  — LLM proxy endpoint (validator injects their LiteLLM proxy)
-#   MODEL_NAME    — which model to call
-#   HF_TOKEN      — API key for the LLM proxy (validator injects this)
-#   LOCAL_IMAGE_NAME — Docker image for from_docker_image() (optional)
-# Defaults match the hackathon sample exactly.
-# The validator overwrites these with their own proxy + model.
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+if not API_BASE_URL or not API_KEY:
+    raise ValueError(
+        "CRITICAL: The grader's API_BASE_URL or API_KEY is missing! "
+        f"API_BASE_URL={API_BASE_URL!r}, API_KEY={'set' if API_KEY else 'MISSING'}"
+    )
+
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
-# Grader injects API_KEY at runtime — always prefer it over HF_TOKEN
-# HF_TOKEN is only used as a fallback for local testing
-API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 # Environment / benchmark label used in [START] log lines
@@ -244,23 +245,20 @@ def get_agent_action(client: OpenAI, obs: HotelReceptionistObservation) -> Hotel
     Falls back to a safe default action if the API call fails.
     """
     user_prompt = build_user_prompt(obs)
-    try:
-        # Call the LLM via HF Router (OpenAI-compatible endpoint)
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.7,
-            max_tokens=512,
-            stream=False,
-        )
-        raw = (completion.choices[0].message.content or "").strip()
-    except Exception as exc:
-        # DO NOT silently swallow — let the grader see the real proxy error
-        print(f"[FATAL] LLM call failed: {exc}", flush=True, file=sys.stderr)
-        raise
+
+    # NO try/except — if the proxy rejects this call, we CRASH loudly
+    # so the raw stack trace appears in the validator log
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.7,
+        max_tokens=512,
+        stream=False,
+    )
+    raw = (completion.choices[0].message.content or "").strip()
 
     # Parse the LLM's JSON response (handles markdown fences and extra text)
     text = raw
